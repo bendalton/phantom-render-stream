@@ -26,11 +26,11 @@ You can also pass some options:
 
 ``` js
 var render = phantom({
-	pool        : 5,           // change the pool size. defaults to 1,
-	format      : 'jpeg',      // the default output format
-	width       : 1280,        // changes the width size. default to 1280
-	height      : 800,         // changes the height size. default to 960
-	debug       : false,       // enable some more debugging. Defaults to false. More details in Troubleshooting section.
+	pool: 5, // change the pool size. defaults to 1,
+	format: 'jpeg', // the default output format
+	width: 1280, // changes the width size. default to 1280
+	height: 800 // changes the height size. default to 960
+	phantomFlags: [], // extra command flags to pass to Phantom
 	fifoDir     : '/some/path' // Where named pipes are stored. Defaults to `os.tmpDir()`
 	paperFormat : 'A4',        // defaults to A4. Also supported: 'A3', 'A4', 'A5', 'Legal', 'Letter', 'Tabloid'.
 	orientation : 'portriat'   // defaults to portrait. 'landscape' is also valid
@@ -46,6 +46,9 @@ Or override the options for each render stream
 ``` js
 render(myUrl, {format:'jpeg', width: 1280, height: 960}).pipe(...)
 ```
+
+As an exception, you can't override the `phantomFlags` for each stream, as
+`phantomjs` as an existing phantom process may be re-used.
 
 ## Supported output formats
 
@@ -103,6 +106,21 @@ Here is an example to illustrate it better.
 </html>
 
 ```
+
+## Troubleshooting
+
+You can pass `debug:true` as an option to turn on additional diagnostics including:
+
+ * piping STDOUT from the phantom processes to STDOUT of this parent process
+ * Printing out the queue size of periodically.
+
+If you are getting undefined error codes and responses when attempting to
+render, it's likely a connection issue of some sort. If the URL uses SSL, adding
+`--ignore-ssl-errors=true` to phantomFlags may help. You also try adding `--debug=true` to
+the `phantomFlags` array.
+
+For extensive detail on what Phantom is doing, there is also some commented out code
+in phantom-process.js that can be enabled by commenting it in for now.
 
 ## OS Dependencies
 

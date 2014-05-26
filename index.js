@@ -10,14 +10,25 @@ var once = require('once');
 var http = require('http');
 var phantomjsPath = require('phantomjs').path;
 
-var spawn = function(opts) {
-	opts = opts || {};
-	var child;
-	var queue = [];
+/**
+ * spawn pops a request off the request queue and sends it to a member of the phantom process pool.
+ * See module.exports for all opts and defaults.
+ */
 
-	var filename = 'phantom-queue-' + process.pid + '-' + Math.random().toString(36).slice(2);
-	if (opts.fifoDir) filename = path.join(opts.fifoDir, filename);
-	else filename = path.join(os.tmpDir(), filename);
+var spawn = function(opts) {
+	var child;
+
+	// Each queued request is represented by an object with the following keys:
+	//		callback -- a function to call with when done
+	//		message  -- JSON structure used to form the request to Phantom JS
+	//		date		 -- current date, just for reference.
+	// Each member of the phantom request pool has its own request queue.
+	var requestQueue = [];
+
+	var fifoFile = path.join(
+			 opts.fifoDir,
+			'phantom-queue-' + process.pid + '-' + Math.random().toString(36).slice(2)
+	);
 
 	var looping = false;
 	var loop = function() {
@@ -26,28 +37,24 @@ var spawn = function(opts) {
 
 		var retries = 0;
 		var timeoutFn = function() {
-			if (++retries >= (opts.maxRetries || 2)) {
+			if (++retries >= opts.maxRetries) {
 				cb(new Error('Too many retries'));
 				looping = false;
-				if (queue.length) loop();
+				if (requestQueue.length) loop();
 			} else {
 				timeout = setTimeout(timeoutFn, 5000);
 				timeout.unref();
 			}
 			if (child) child.kill();
-			
+
 		};
-		var timeout; 
-		if (opts.timeout) {
-			timeout = setTimeout(timeoutFn, opts.timeout);
-			timeout.unref();
-		}
+		var timeout = setTimeout(timeoutFn, opts.timeout);
+		timeout.unref();
 
-
-		var result = fs.createReadStream(filename);
+		var result = fs.createReadStream(fifoFile);
 		var cb = once(function(err, val) {
 			clearTimeout(timeout);
-			queue.shift().callback(err, val);
+			requestQueue.shift().callback(err, val);
 		});
 
 		result.once('readable', function() {
@@ -65,13 +72,16 @@ var spawn = function(opts) {
 			cb(new Error('Render failed (no data)'));
 
 			looping = false;
-			if (queue.length) loop();
+			if (requestQueue.length) loop();
 		});
 	};
 
+	// Ensure we have a child rendering process and return it.
+	// We can send our requests to it as JSON messages on its STDIN
 	var ensure = function() {
 		if (child) return child;
-		child = cp.spawn(phantomjsPath, [path.join(__dirname, 'phantom-process.js'), filename]);
+		var phantomJsArgs = opts.phantomFlags.concat(path.join(__dirname, 'phantom-process.js'), fifoFile);
+		child = cp.spawn(phantomjsPath, phantomJsArgs);
 
 		var onerror = once(function() {
 			child.kill();
@@ -87,17 +97,22 @@ var spawn = function(opts) {
 		child.unref();
 
 		if (opts.debug) {
-			child.stderr.pipe(process.stdout);
 			child.stdout.pipe(process.stdout);
 		} else {
-			child.stderr.resume();
 			child.stdout.resume();
 		}
 
+		// Always make the child's stderr available for better diagnostics.
+		child.stderr.pipe(process.stderr);
+
+		child.on('error', function(error) {
+			throw new Error("Failed to spawn Phantom. Error was: '"+error+"'. System call was: "+phantomjsPath+' '+phantomJsArgs.join(' '));
+		});
+
 		child.on('exit', function() {
 			child = null;
-			if (!queue.length) return;
-			queue.forEach(function(el) {
+			if (!requestQueue.length) return;
+			requestQueue.forEach(function(el) {
 				ensure().stdin.write(el.message);
 			});
 		});
@@ -105,37 +120,41 @@ var spawn = function(opts) {
 	};
 
 	var fifo = thunky(function(cb) {
-		cp.spawn('mkfifo', [filename]).on('exit', cb).on('error', cb);
+		cp.spawn('mkfifo', [fifoFile], { stdio: 'inherit' }).on('exit', cb).on('error', cb);
 	});
 
 	var free = function() {
 		ret.using--;
 	};
 
-	var ret = function(ropts, cb) {
+	// The return value of this pool member.
+	var ret = function(renderOpts, cb) {
 		ret.using++;
 
+		// When done, reduce the number of of active pool members by one.
 		var done = function(err, stream) {
 			if (stream) stream.on('end', free);
 			else free();
 			cb(err, stream);
-			if (opts.debug) console.log('queue size: ', queue.length);
+			if (opts.debug) console.log('queue size: ', requestQueue.length);
 		};
 
+		// Create the fifo if it's not been created, and write our request to it.
+		// Push a copy of the the request and a "done()" callback on to requestQueue to keep track of it.
 		fifo(function(err) {
-			if (err) return done(typeof err === 'number' ? new Error('mkfifo exited with '+err) : err);
-			var msg = JSON.stringify(ropts)+'\n';
-			queue.push({callback: done, message: msg, date: Date.now()});
+			if (err) return done(typeof err === 'number' ? new Error('mkfifo '+fifoFile+' exited with '+err) : err);
+			var msg = JSON.stringify(renderOpts)+'\n';
+			requestQueue.push({callback: done, message: msg, date: Date.now()});
 			ensure().stdin.write(msg);
-			if (queue.length === 1) loop();
-			if (opts.debug) console.log('queue size: ', queue.length);
+			if (requestQueue.length === 1) loop();
+			if (opts.debug) console.log('queue size: ', requestQueue.length);
 		});
 	};
 
 	ret.using = 0;
 	ret.destroy = function(cb) {
 		if (child) child.kill();
-		fs.unlink(filename, function() {
+		fs.unlink(fifoFile, function() {
 			if (cb) cb();
 		});
 	};
@@ -143,27 +162,38 @@ var spawn = function(opts) {
 	return ret;
 };
 
-module.exports = function(opts) {
-	opts = opts || {};
-	opts.pool = opts.pool || 1;
+module.exports = function(userOpts) {
 
-  // Create a pool size equal to the number provided in opts.pool
-	var pool = [];
+	var defaultOpts = {
+		pool				: 1,
+		maxRetries	: 2,
+		fifoDir			: os.tmpDir(),
+		timeout			: 5000, // milliseconds
+		debug				: false,
+		phantomFlags: [],
+	};
+
+	var opts = xtend(defaultOpts,userOpts);
+
+	// Create a pool of Phantom processes size	the number provided in opts.pool
+	var phantomPool = [];
 	for (var i = 0; i < opts.pool; i++) {
-		pool.push(spawn(opts));
+		phantomPool.push(spawn(opts));
 	}
 
+	// Find the phantom pool member with the shortest queue and send our request to it.
 	var select = function() {
-		return pool.reduce(function(a, b) {
+		return phantomPool.reduce(function(a, b) {
 			return a.using <= b.using ? a : b;
 		});
 	};
 
-	var render = function(url, ropts) {
-		ropts = xtend(opts, ropts);
-		ropts.url = url;
+	// Move the 'url' to the options and pass it to a pool member to render.
+	var render = function(url, renderOpts) {
+		renderOpts = xtend(opts, renderOpts);
+		renderOpts.url = url;
 		var pt = stream.PassThrough();
-		select()(ropts, function(err, stream) {
+		select()(renderOpts, function(err, stream) {
 			if (err) return pt.emit('error', err);
 			if (destroyed) return stream.destroy();
 			stream.pipe(pt);
@@ -184,7 +214,7 @@ module.exports = function(opts) {
 
 	render.destroy = function(cb) {
 		var next = afterAll(cb);
-		pool.forEach(function(ps) {
+		phantomPool.forEach(function(ps) {
 			ps.destroy(next());
 		});
 	};
